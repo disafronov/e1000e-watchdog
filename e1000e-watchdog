@@ -1,0 +1,90 @@
+#!/bin/bash
+
+PCI_ID="0000:00:1f.6"
+MARKER_FILE="/tmp/reset_e1000e_marker"
+LOGGER_TAG="e1000e-watchdog"
+
+find_interface() {
+  local pci_id="$1"
+  for i in {1..5}; do
+    iface=$(ls -1 /sys/bus/pci/devices/$pci_id/net/ 2>/dev/null | head -n1)
+    if [ -n "$iface" ]; then
+      echo "$iface"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+interface_operstate() {
+  local iface="$1"
+  cat /sys/class/net/$iface/operstate 2>/dev/null
+}
+
+interface_rx_traffic_dead() {
+  local iface="$1"
+  local rx1 rx2
+  rx1=$(cat /sys/class/net/$iface/statistics/rx_packets 2>/dev/null)
+  sleep 1
+  rx2=$(cat /sys/class/net/$iface/statistics/rx_packets 2>/dev/null)
+  [ "$rx1" = "$rx2" ]
+}
+
+journalctl -f -o cat | while read -r line; do
+  if echo "$line" | grep -q "Detected Hardware Unit Hang"; then
+
+    INTERFACE=$(find_interface "$PCI_ID")
+    if [ -z "$INTERFACE" ]; then
+      logger -s -t "$LOGGER_TAG" "No interface found for PCI ID $PCI_ID"
+      continue
+    fi
+
+    msg_hash=$(echo "$line" | md5sum | cut -d' ' -f1)
+    if [ -f "$MARKER_FILE" ] && [ "$msg_hash" = "$(cat "$MARKER_FILE")" ]; then
+      continue
+    fi
+
+    echo "$msg_hash" > "$MARKER_FILE"
+
+    STATE=$(interface_operstate "$INTERFACE")
+    if [ "$STATE" = "up" ]; then
+      if interface_rx_traffic_dead "$INTERFACE"; then
+        logger -s -t "$LOGGER_TAG" "$INTERFACE is UP but not receiving traffic — proceeding with reset"
+      else
+        logger -s -t "$LOGGER_TAG" "$INTERFACE is UP and has RX traffic — skipping reset"
+        continue
+      fi
+    else
+      logger -s -t "$LOGGER_TAG" "$INTERFACE state is $STATE — proceeding with reset"
+    fi
+
+    logger -s -t "$LOGGER_TAG" "Performing PCI reset on $INTERFACE"
+
+    ip link set "$INTERFACE" down
+    echo 1 > "/sys/bus/pci/devices/$PCI_ID/remove"
+    sleep 2
+    echo 1 > "/sys/bus/pci/rescan"
+    sleep 3
+
+    INTERFACE=$(find_interface "$PCI_ID")
+    if [ -z "$INTERFACE" ]; then
+      logger -s -t "$LOGGER_TAG" "After PCI rescan, interface not found — aborting"
+      continue
+    fi
+
+    ip link set "$INTERFACE" up
+    sleep 2
+
+    if command -v ifreload >/dev/null; then
+      ifreload -i "$INTERFACE"
+    fi
+
+    STATE=$(interface_operstate "$INTERFACE")
+    if [ "$STATE" = "up" ]; then
+      logger -s -t "$LOGGER_TAG" "Interface $INTERFACE is back UP after PCI reset"
+    else
+      logger -s -t "$LOGGER_TAG" "WARNING: Interface $INTERFACE did not come UP after reset"
+    fi
+  fi
+done
