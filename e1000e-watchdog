@@ -31,36 +31,64 @@ interface_rx_traffic_dead() {
   [ "$rx1" = "$rx2" ]
 }
 
+# Function to get gateway for the interface
+gateway_for_interface() {
+  local iface="$1"
+  ip route show dev "$iface" 2>/dev/null | awk '/default/ {print $3}' | head -n1
+}
+
+# Function to check gateway reachability for the interface
+check_gateway_reachability() {
+  local iface="$1"
+  local gw
+  gw=$(ip route show dev "$iface" 2>/dev/null | awk '/default/ {print $3}' | head -n1)
+  if [ -z "$gw" ]; then
+    logger -t "$LOGGER_TAG" -s "No gateway found for $iface"
+    return 1
+  fi
+  local i
+  for i in {1..4}; do
+    if ping -c 1 -W 1 -I "$iface" "$gw" >/dev/null 2>&1; then
+      logger -t "$LOGGER_TAG" -s "Ping to gateway $gw via $iface successful"
+      return 0
+    fi
+  done
+  logger -t "$LOGGER_TAG" -s "Ping to gateway $gw via $iface failed after 4 attempts"
+  return 1
+}
+
 journalctl -f -o cat | while read -r line; do
   if echo "$line" | grep -q "Detected Hardware Unit Hang"; then
 
     INTERFACE=$(find_interface "$PCI_ID")
     if [ -z "$INTERFACE" ]; then
-      logger -s -t "$LOGGER_TAG" "No interface found for PCI ID $PCI_ID"
+      logger -t "$LOGGER_TAG" -s "No interface found for PCI ID $PCI_ID"
       continue
     fi
 
-    msg_hash=$(echo "$line" | md5sum | cut -d' ' -f1)
-    if [ -f "$MARKER_FILE" ] && [ "$msg_hash" = "$(cat "$MARKER_FILE")" ]; then
+    # Check gateway reachability before any actions
+    if check_gateway_reachability "$INTERFACE"; then
+      logger -t "$LOGGER_TAG" -s "Gateway reachable before any actions, skipping reset actions"
       continue
     fi
 
-    echo "$msg_hash" > "$MARKER_FILE"
-
-    STATE=$(interface_operstate "$INTERFACE")
-    if [ "$STATE" = "up" ]; then
-      if interface_rx_traffic_dead "$INTERFACE"; then
-        logger -s -t "$LOGGER_TAG" "$INTERFACE is UP but not receiving traffic — proceeding with reset"
-      else
-        logger -s -t "$LOGGER_TAG" "$INTERFACE is UP and has RX traffic — skipping reset"
-        continue
-      fi
-    else
-      logger -s -t "$LOGGER_TAG" "$INTERFACE state is $STATE — proceeding with reset"
+    # Restart interface
+    ip link set "$INTERFACE" down
+    sleep 2
+    ip link set "$INTERFACE" up
+    sleep 2
+    if command -v ifreload >/dev/null; then
+      ifreload -i "$INTERFACE"
     fi
 
-    logger -s -t "$LOGGER_TAG" "Performing PCI reset on $INTERFACE"
+    # Check gateway reachability after interface restart
+    if check_gateway_reachability "$INTERFACE"; then
+      logger -t "$LOGGER_TAG" -s "Gateway reachable after interface restart, skipping PCI reset"
+      continue
+    fi
 
+    # Proceed with PCI reset as last resort
+    logger -t "$LOGGER_TAG" -s "Proceeding with PCI reset on $INTERFACE"
     ip link set "$INTERFACE" down
     echo 1 > "/sys/bus/pci/devices/$PCI_ID/remove"
     sleep 2
@@ -69,22 +97,22 @@ journalctl -f -o cat | while read -r line; do
 
     INTERFACE=$(find_interface "$PCI_ID")
     if [ -z "$INTERFACE" ]; then
-      logger -s -t "$LOGGER_TAG" "After PCI rescan, interface not found — aborting"
+      logger -t "$LOGGER_TAG" -s "After PCI rescan, interface not found — aborting"
       continue
     fi
 
     ip link set "$INTERFACE" up
     sleep 2
-
     if command -v ifreload >/dev/null; then
       ifreload -i "$INTERFACE"
     fi
 
-    STATE=$(interface_operstate "$INTERFACE")
-    if [ "$STATE" = "up" ]; then
-      logger -s -t "$LOGGER_TAG" "Interface $INTERFACE is back UP after PCI reset"
+    # Final check after PCI reset
+    if check_gateway_reachability "$INTERFACE"; then
+      logger -t "$LOGGER_TAG" -s "Gateway reachable after PCI reset"
     else
-      logger -s -t "$LOGGER_TAG" "WARNING: Interface $INTERFACE did not come UP after reset"
+      logger -t "$LOGGER_TAG" -s "WARNING: Gateway still unreachable after PCI reset, rebooting system"
+      reboot
     fi
   fi
 done
