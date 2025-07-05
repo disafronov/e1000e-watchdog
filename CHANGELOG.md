@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2025-07-05
+
+### 🚀 Features
+
+- Add gateway reachability checks and interface management to e1000e-watchdog
+
 ## [0.1.0] - 2025-06-20
 
 ### 🚀 Features
